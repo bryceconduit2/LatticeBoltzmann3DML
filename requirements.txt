@@ -1,0 +1,5 @@
+matplotlib==3.11.2
+numpy==2.5.3
+scipy==1.18.1
+torch==2.14.1
+trimesh==5.1.0
