@@ -1,4 +1,7 @@
+import os
+import tempfile
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -147,6 +150,34 @@ class GeometryToFlowGNN(nn.Module):
     def normalize_velocity(self, velocity):
         return self.decoder.normalize_output(velocity)
 
+
+def _save_training_checkpoint(model, optimizer, epoch, checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=checkpoint_path.parent,
+        prefix=f".{checkpoint_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+
+    try:
+        torch.save(
+            {
+                "format_version": 1,
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            },
+            temporary_path,
+        )
+        os.replace(temporary_path, checkpoint_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 from lbm_gnn import (
     LBMGraphSuperResolutionGNN,
     build_geometry_representations,
@@ -208,8 +239,8 @@ if __name__ == "__main__":
     # Execution Settings
     lbm_warmup_steps = 600
     train_epochs = 100
-    checkpoint_path = "cfd_flow_predictor_gnn.pt"
-    mode = "train"  # Set to "load" to skip training
+    checkpoint_path = Path(__file__).resolve().with_name("cfd_flow_predictor_gnn.pt")
+    mode = "resume"  # Use "train" to start fresh or "load" for inference only.
 
     print("=" * 60)
     print("CFD FLOW SURROGATE PREDICTION PIPELINE")
@@ -230,9 +261,51 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     # STEP 1: Train Encoder-Decoder End-to-End
     # ---------------------------------------------------------
-    if mode == "train":
+    if mode in {"train", "resume"}:
         optimizer = torch.optim.AdamW(surrogate_model.parameters(), lr=1e-3)
         criterion = torch.nn.MSELoss()
+        start_epoch = 1
+
+        if mode == "resume":
+            print(f"\nResuming training from '{checkpoint_path}'...")
+            training_checkpoint = torch.load(
+                checkpoint_path, map_location=device, weights_only=True
+            )
+            required_keys = {
+                "format_version",
+                "epoch",
+                "model_state_dict",
+                "optimizer_state_dict",
+            }
+            if isinstance(training_checkpoint, dict) and required_keys.issubset(
+                training_checkpoint
+            ):
+                if training_checkpoint["format_version"] != 1:
+                    raise RuntimeError(
+                        f"Checkpoint '{checkpoint_path}' uses an unsupported format version."
+                    )
+                completed_epoch = training_checkpoint["epoch"]
+                if type(completed_epoch) is not int or completed_epoch < 0:
+                    raise RuntimeError(
+                        f"Checkpoint '{checkpoint_path}' has an invalid completed epoch."
+                    )
+
+                surrogate_model.load_state_dict(
+                    training_checkpoint["model_state_dict"]
+                )
+                optimizer.load_state_dict(training_checkpoint["optimizer_state_dict"])
+                start_epoch = completed_epoch + 1
+                print(f"Restored through epoch {completed_epoch}.")
+            else:
+                surrogate_model.load_state_dict(training_checkpoint)
+                _save_training_checkpoint(
+                    surrogate_model, optimizer, 0, checkpoint_path
+                )
+                print(
+                    "Loaded legacy model weights. This file has no saved optimizer "
+                    "state or epoch number, so the optimizer starts fresh and training "
+                    "continues from these weights at epoch 1."
+                )
 
         def generate_training_sample(geom, sample_radius):
             mesh = create_cubic_mesh_graph(
@@ -274,25 +347,45 @@ if __name__ == "__main__":
         if not training_geometries:
             raise ValueError("training_geometries must contain at least one geometry")
 
-        velocity_sum = torch.zeros(3, device=device)
-        velocity_squared_sum = torch.zeros(3, device=device)
-        velocity_node_count = 0
-        for geom, sample_radius in training_samples:
-            _, training_velocity = generate_training_sample(geom, sample_radius)
-            velocity_sum += training_velocity.sum(dim=1)
-            velocity_squared_sum += training_velocity.square().sum(dim=1)
-            velocity_node_count += training_velocity.size(1)
+        if mode == "train":
+            velocity_sum = torch.zeros(3, device=device)
+            velocity_squared_sum = torch.zeros(3, device=device)
+            velocity_node_count = 0
+            for sample_index, (geom, sample_radius) in enumerate(
+                training_samples, start=1
+            ):
+                print(
+                    "Calculating output normalization: "
+                    f"sample {sample_index}/{len(training_samples)} "
+                    f"({geom}, radius {sample_radius})",
+                    flush=True,
+                )
+                _, training_velocity = generate_training_sample(geom, sample_radius)
+                velocity_sum += training_velocity.sum(dim=1)
+                velocity_squared_sum += training_velocity.square().sum(dim=1)
+                velocity_node_count += training_velocity.size(1)
 
-        output_mean = velocity_sum / velocity_node_count
-        output_variance = (velocity_squared_sum / velocity_node_count - output_mean.square()).clamp_min(0.0)
-        output_std = output_variance.sqrt()
-        surrogate_model.decoder.set_output_statistics(output_mean, output_std)
+            output_mean = velocity_sum / velocity_node_count
+            output_variance = (
+                velocity_squared_sum / velocity_node_count - output_mean.square()
+            ).clamp_min(0.0)
+            output_std = output_variance.sqrt()
+            surrogate_model.decoder.set_output_statistics(output_mean, output_std)
+            _save_training_checkpoint(surrogate_model, optimizer, 0, checkpoint_path)
 
         print("\n[Phase 1/3] Training Encoder-Decoder GNN end-to-end...")
-        for epoch in range(1, train_epochs + 1):
+        for epoch in range(start_epoch, train_epochs + 1):
             total_epoch_loss = 0.0
 
-            for geom, sample_radius in training_samples:
+            for sample_index, (geom, sample_radius) in enumerate(
+                training_samples, start=1
+            ):
+                print(
+                    f"Training epoch {epoch}/{train_epochs}: "
+                    f"sample {sample_index}/{len(training_samples)} "
+                    f"({geom}, radius {sample_radius})",
+                    flush=True,
+                )
                 # 1. Build mesh graph and run LBM for the target flow
                 mesh, gt_velocity = generate_training_sample(geom, sample_radius)
                 (
@@ -322,15 +415,19 @@ if __name__ == "__main__":
                 total_epoch_loss += loss.item()
 
             avg_loss = total_epoch_loss / len(training_samples)
+            _save_training_checkpoint(surrogate_model, optimizer, epoch, checkpoint_path)
             if epoch % 10 == 0 or epoch == 1:
                 print(f"Epoch [{epoch:02d}/{train_epochs:02d}] - Training MSE Loss: {avg_loss:.6e}")
 
-        torch.save(surrogate_model.state_dict(), checkpoint_path)
-        print(f"Model saved to '{checkpoint_path}'.")
+        print(f"Training checkpoint saved to '{checkpoint_path}'.")
 
-    else:
+    elif mode == "load":
         print(f"\nLoading trained weights from '{checkpoint_path}'...")
-        state_dict = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
         load_result = surrogate_model.load_state_dict(state_dict, strict=False)
         legacy_normalization_keys = {"decoder.output_mean", "decoder.output_std"}
         missing_keys = set(load_result.missing_keys)
@@ -345,6 +442,8 @@ if __name__ == "__main__":
                 "Checkpoint has no output normalization statistics; "
                 "using identity normalization for legacy weights."
             )
+    else:
+        raise ValueError("mode must be 'train', 'resume', or 'load'")
 
     # ---------------------------------------------------------
     # STEP 2: Zero-Shot Prediction on Unseen Test Geometry
